@@ -36,6 +36,11 @@ audit:
 dry-run-import:
     BACKEND_REPO="{{backend_repo}}" ./scripts/backend-compose-run.sh python -m commands.migrate_legacy_data --manifest reports/legacy-migration-import-dry-run.json
 
+# Execute the importer without author.
+execute-import-without-author:
+    BACKEND_REPO="{{backend_repo}}" ./scripts/backend-compose-run.sh python -m commands.migrate_legacy_data --execute --allow-warnings --manifest reports/legacy-migration-import-run.json
+
+
 # Execute the importer. Requires an explicit target publication author username.
 execute-import AUTHOR:
     BACKEND_REPO="{{backend_repo}}" ./scripts/backend-compose-run.sh python -m commands.migrate_legacy_data --execute --publication-author-username "{{AUTHOR}}" --allow-warnings --manifest reports/legacy-migration-import-run.json
