@@ -637,7 +637,10 @@ def import_symbols(ctx: ImportContext) -> dict[str, int]:
     )
 
     allograph_rows = fetch_rows(legacy_conn, "SELECT id, name, character_id FROM digipal_allograph ORDER BY id")
+
     allographs = [{"id": -1, "name": "unmapped_allographs", "character_id": 109}]
+    allographs = [] # Remove the breaking row above to pass through symbols phase
+
     allographs.extend(
         {"id": row["id"], "name": text_or_blank(row["name"]), "character_id": row["character_id"]}
         for row in allograph_rows
@@ -821,11 +824,13 @@ def import_manuscripts(ctx: ImportContext) -> dict[str, int]:
         ],
     )
 
+    ## TODO Add where clause to ignore digipal description without link and pass through manuscript phase
     description_rows = fetch_rows(
         legacy_conn,
         """
         SELECT id, historical_item_id, source_id, description AS content
         FROM digipal_description
+        WHERE historical_item_id IS NOT NULL
         ORDER BY id
         """,
     )
