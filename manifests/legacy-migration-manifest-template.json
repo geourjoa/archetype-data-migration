@@ -186,7 +186,7 @@
       "validation_evidence": []
     }
   ],
-  "procedure_version": "2026-06-09",
+  "procedure_version": "2026-06-16",
   "schema_version": 1,
   "target": {
     "database_url_env": "TARGET_DATABASE_URL or DATABASE_URL",

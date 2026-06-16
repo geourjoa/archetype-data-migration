@@ -1,6 +1,6 @@
 # Legacy Migration Operator Guide
 
-Procedure version: `2026-06-09`
+Procedure version: `2026-06-16`
 
 This is the operational wrapper around the database map, migration plan, and read-only audit. It is designed for deployment runbooks, safe trial imports, and final migration evidence.
 
@@ -19,6 +19,21 @@ The current safe position is deliberate: generate instructions, run preflight ch
 
 This migration should be a manual deployment lane, not an automatic step on every deploy. The automatic deploy can run tests and the read-only audit; the write importer should require explicit environment variables, approvals, backups, and a filled manifest.
 
+## Command Semantics
+
+- `legacy_migration_procedure` renders instructions and a manifest template; it does not test an import.
+- `audit_legacy_migration` compares source and target contents without writing. Against a fresh empty target, `fail` and a non-zero exit are normally expected because source rows are missing from the target; the generated report is still the useful baseline evidence.
+- `migrate_legacy_data` without `--execute` validates connections, tables, planning queries, phase order, and planned counts. It does not test inserts or target constraints.
+- `migrate_legacy_data --execute` writes supported mappings and then runs the post-import audit.
+- A post-import `fail` is a blocker. `--allow-warnings` accepts reviewed warnings only and never accepts `fail`.
+- `--publication-author-username` must name an existing target `auth_user`; the importer does not create that user.
+
+## Source Database Variability
+
+DigiPal databases can share a schema while containing different identifiers, optional relationships, vocabularies, and data-quality cases. The checked-in audit describes one inspected source snapshot, not every DigiPal installation. Review every new source independently and do not silently remove rows to make an import pass.
+
+Legacy `digipal_description` rows may refer to a historical item or to a text. The current importer supports historical-item descriptions. Text-only descriptions and rows linked to neither entity require an explicit mapping, quarantine, or approved exclusion policy before execution.
+
 ## Safety Gates
 
 | Gate | Rule | Evidence |
@@ -26,7 +41,7 @@ This migration should be a manual deployment lane, not an automatic step on ever
 | Run through Docker Compose | Run backend migration commands in the Compose API container, not host Python. | Command log shows docker compose run/exec for every DB operation. |
 | Backups before writes | Create verified custom-format dumps of legacy and target databases before any write importer runs. | Manifest records dump filenames, checksums, sizes, and storage location. |
 | Refuse same source and target | The legacy URL and target URL must resolve to different database names. | Preflight/audit exits before import when the names match. |
-| Read-only audit gate | Run audit_legacy_migration first. Treat fail as a blocker and require sign-off for warnings. | Manifest stores audit output path, status, and accepted warnings. |
+| Read-only audit gate | Run audit_legacy_migration before and after import. An empty-target baseline normally fails for missing target rows; after import, fail is a blocker and warnings require sign-off. | Manifest stores baseline and post-import audit paths, statuses, and accepted warnings. |
 | Empty target by default | Run the write importer only against a freshly migrated target DB unless explicitly approved. | Preflight row-count report is attached to the manifest. |
 | Publication author policy | Do not map publication authors by legacy numeric id. Use username/email mapping or a fallback author. | Manifest records the chosen author policy and sample resolved posts. |
 | Transaction per phase | Each import phase must be atomic and independently auditable. | Manifest records phase start/end time, status, row counts, and rollback reference. |
@@ -59,12 +74,13 @@ Confirm environment, database URLs, schema state, table availability, and target
 
 Importer contract:
 - Verify legacy and target URLs are present and point to different databases.
-- Run the read-only audit before any write step.
+- Run and preserve the read-only baseline audit before any write step.
+- Profile source-specific optional relationships and data-quality cases before execution.
 - Collect target migration state and current domain row counts.
 - Stop if the target is non-empty unless an explicit audit/update mode is approved.
 
 Validation:
-- audit_legacy_migration exits without fail status.
+- audit_legacy_migration completes and its expected empty-target failures are understood.
 - showmigrations reports all expected target migrations applied.
 - Manifest contains operator, environment, source dump, target dump, and approval fields.
 
@@ -121,7 +137,7 @@ Import characters, allographs, components, features, and positions before graph 
 
 Importer contract:
 - Preserve ids for direct vocabularies.
-- Keep documented placeholder ids such as allograph -1 explicit.
+- Create symbol placeholder rows only when a source-specific policy requires them.
 - Skip known stale/duplicate rows only when listed in the accepted audit warnings.
 
 Validation:
@@ -259,6 +275,7 @@ Rollback: Restore the pre-cutover target dump and return traffic to the previous
 
 - CI should run unit tests for the audit/procedure modules.
 - Pre-cutover should run `audit_legacy_migration`; fail status blocks the deployment.
+  This refers to the populated target after import, not the expected empty-target baseline.
 - Warning status requires a human to list accepted warnings in the manifest.
 - `migrate_legacy_data` plans by default and writes only with `--execute`.
 - The write import should run against a freshly migrated target unless `--allow-non-empty-target` is explicitly approved.
@@ -329,6 +346,8 @@ Plan first. This connects to both databases and returns expected row counts with
   --manifest reports/legacy-migration-import-dry-run.json
 ```
 
+A successful dry run proves that the import can be planned. It does not prove that inserts, foreign keys, unique constraints, or post-import comparisons will pass.
+
 Execute only against a backed-up, freshly migrated target database:
 
 ```bash
@@ -339,5 +358,7 @@ Execute only against a backed-up, freshly migrated target database:
   --allow-warnings \
   --manifest reports/legacy-migration-import-run.json
 ```
+
+The publication author username must already exist in the target database. `--allow-warnings` permits reviewed warning status but never permits fail status.
 
 The command refuses same-database URLs, missing tables, and non-empty import targets by default. Use `--allow-non-empty-target` only for an approved recovery or incremental trial.

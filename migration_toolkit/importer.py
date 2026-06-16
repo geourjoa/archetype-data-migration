@@ -225,7 +225,7 @@ SOURCE_COUNT_SQL: dict[str, dict[str, str]] = {
     },
     "symbols": {
         "symbols_structure_character": "SELECT count(*) FROM digipal_character",
-        "symbols_structure_allograph": "SELECT count(*) + 1 FROM digipal_allograph",
+        "symbols_structure_allograph": "SELECT count(*) FROM digipal_allograph",
         "symbols_structure_feature": "SELECT count(*) FROM digipal_feature",
         "symbols_structure_component": "SELECT count(*) FROM digipal_component",
         "symbols_structure_component_features": "SELECT count(*) FROM digipal_component_features",
@@ -330,6 +330,8 @@ class ImportReport:
     phases: list[PhaseResult]
     target_row_counts_before: dict[str, int]
     target_row_counts_after: dict[str, int]
+    source_profile: dict[str, Any] = field(default_factory=dict)
+    source_warnings: list[str] = field(default_factory=list)
     audit: dict[str, Any] | None = None
 
     @property
@@ -338,6 +340,8 @@ class ImportReport:
             return "fail"
         if self.audit and self.audit.get("status") == "fail":
             return "fail"
+        if self.source_warnings:
+            return "warn"
         if any(phase.status == "warn" for phase in self.phases):
             return "warn"
         if self.audit and self.audit.get("status") == "warn":
@@ -448,6 +452,17 @@ def scalar(conn: Connection[Any], query: str, params: tuple[Any, ...] | dict[str
     return row[0]
 
 
+def optional_scalar(
+    conn: Connection[Any], query: str, params: tuple[Any, ...] | dict[str, Any] | None = None
+) -> Any | None:
+    with conn.cursor() as cursor:
+        cursor.execute(query, params)
+        row = cursor.fetchone()
+    if row is None:
+        return None
+    return row[0]
+
+
 def insert_rows(conn: Connection[Any], query: str, rows: list[dict[str, Any]]) -> int:
     if not rows:
         return 0
@@ -462,6 +477,188 @@ def target_domain_counts(conn: Connection[Any]) -> dict[str, int]:
 
 def phase_plan_counts(legacy_conn: Connection[Any], phase: str) -> dict[str, int]:
     return {table: int(scalar(legacy_conn, query)) for table, query in SOURCE_COUNT_SQL[phase].items()}
+
+
+def description_relationship_profile(legacy_conn: Connection[Any]) -> dict[str, Any]:
+    counts = fetch_rows(
+        legacy_conn,
+        """
+        SELECT
+          count(*) FILTER (WHERE historical_item_id IS NOT NULL AND text_id IS NULL) AS historical_only,
+          count(*) FILTER (WHERE historical_item_id IS NULL AND text_id IS NOT NULL) AS text_only,
+          count(*) FILTER (WHERE historical_item_id IS NOT NULL AND text_id IS NOT NULL) AS both_links,
+          count(*) FILTER (WHERE historical_item_id IS NULL AND text_id IS NULL) AS neither_link,
+          count(*) FILTER (
+            WHERE historical_item_id IS NOT NULL
+              AND NOT EXISTS (
+                SELECT 1 FROM digipal_historicalitem h WHERE h.id = digipal_description.historical_item_id
+              )
+          ) AS dangling_historical_item
+        FROM digipal_description
+        """,
+    )[0]
+    samples = {
+        "text_only": [
+            row["id"]
+            for row in fetch_rows(
+                legacy_conn,
+                """
+                SELECT id
+                FROM digipal_description
+                WHERE historical_item_id IS NULL AND text_id IS NOT NULL
+                ORDER BY id
+                LIMIT 10
+                """,
+            )
+        ],
+        "both_links": [
+            row["id"]
+            for row in fetch_rows(
+                legacy_conn,
+                """
+                SELECT id
+                FROM digipal_description
+                WHERE historical_item_id IS NOT NULL AND text_id IS NOT NULL
+                ORDER BY id
+                LIMIT 10
+                """,
+            )
+        ],
+        "neither_link": [
+            row["id"]
+            for row in fetch_rows(
+                legacy_conn,
+                """
+                SELECT id
+                FROM digipal_description
+                WHERE historical_item_id IS NULL AND text_id IS NULL
+                ORDER BY id
+                LIMIT 10
+                """,
+            )
+        ],
+        "dangling_historical_item": [
+            row["id"]
+            for row in fetch_rows(
+                legacy_conn,
+                """
+                SELECT d.id
+                FROM digipal_description d
+                LEFT JOIN digipal_historicalitem h ON h.id = d.historical_item_id
+                WHERE d.historical_item_id IS NOT NULL AND h.id IS NULL
+                ORDER BY d.id
+                LIMIT 10
+                """,
+            )
+        ],
+    }
+    return {
+        "counts": {key: int(value or 0) for key, value in counts.items()},
+        "samples": samples,
+    }
+
+
+def allograph_character_profile(legacy_conn: Connection[Any]) -> dict[str, Any]:
+    rows = fetch_rows(
+        legacy_conn,
+        """
+        SELECT a.id, a.name, a.character_id
+        FROM digipal_allograph a
+        LEFT JOIN digipal_character c ON c.id = a.character_id
+        WHERE a.character_id IS NULL OR c.id IS NULL
+        ORDER BY a.id
+        LIMIT 10
+        """,
+    )
+    count = int(
+        scalar(
+            legacy_conn,
+            """
+            SELECT count(*)
+            FROM digipal_allograph a
+            LEFT JOIN digipal_character c ON c.id = a.character_id
+            WHERE a.character_id IS NULL OR c.id IS NULL
+            """,
+        )
+    )
+    return {"missing_character_count": count, "sample": rows}
+
+
+def legacy_publication_author_profile(legacy_conn: Connection[Any]) -> dict[str, Any]:
+    rows = fetch_rows(
+        legacy_conn,
+        """
+        SELECT b.user_id AS id, u.username, count(*) AS post_count
+        FROM blog_blogpost b
+        JOIN auth_user u ON u.id = b.user_id
+        GROUP BY b.user_id, u.username
+        ORDER BY b.user_id
+        """,
+    )
+    return {"authors": rows}
+
+
+def build_source_profile(legacy_conn: Connection[Any]) -> dict[str, Any]:
+    return {
+        "description_relationships": description_relationship_profile(legacy_conn),
+        "allograph_character_integrity": allograph_character_profile(legacy_conn),
+        "legacy_publication_authors": legacy_publication_author_profile(legacy_conn),
+    }
+
+
+def source_profile_warnings(profile: dict[str, Any]) -> list[str]:
+    warnings: list[str] = []
+    description_counts = profile["description_relationships"]["counts"]
+    if description_counts["text_only"]:
+        warnings.append(
+            "Legacy digipal_description contains text-only rows that are not imported by the current "
+            f"historical-item description mapping: {description_counts['text_only']}"
+        )
+    if description_counts["both_links"]:
+        warnings.append(
+            "Legacy digipal_description contains rows linked to both a historical item and text; the current "
+            f"importer treats them as historical-item descriptions: {description_counts['both_links']}"
+        )
+    if description_counts["neither_link"]:
+        warnings.append(
+            "Legacy digipal_description contains rows linked to neither a historical item nor text: "
+            f"{description_counts['neither_link']}"
+        )
+    if description_counts["dangling_historical_item"]:
+        warnings.append(
+            "Legacy digipal_description contains rows whose historical_item_id does not exist: "
+            f"{description_counts['dangling_historical_item']}"
+        )
+
+    missing_allograph_characters = profile["allograph_character_integrity"]["missing_character_count"]
+    if missing_allograph_characters:
+        warnings.append(
+            f"Legacy digipal_allograph contains rows with missing character links: {missing_allograph_characters}"
+        )
+    return warnings
+
+
+def source_profile_blockers(profile: dict[str, Any], phases: tuple[str, ...]) -> list[str]:
+    blockers: list[str] = []
+    description_counts = profile["description_relationships"]["counts"]
+    if "manuscripts" in phases:
+        unsupported_descriptions = (
+            description_counts["text_only"]
+            + description_counts["neither_link"]
+            + description_counts["dangling_historical_item"]
+        )
+        if unsupported_descriptions:
+            blockers.append(
+                "The manuscripts phase cannot safely import all digipal_description rows. "
+                "Run a dry run and review source_profile.description_relationships before choosing a mapping, "
+                "quarantine, or exclusion policy."
+            )
+    if "symbols" in phases and profile["allograph_character_integrity"]["missing_character_count"]:
+        blockers.append(
+            "The symbols phase cannot import allographs whose character_id is missing from digipal_character. "
+            "Repair the source data or define an explicit placeholder policy."
+        )
+    return blockers
 
 
 def assert_target_ready(counts: dict[str, int], phases: tuple[str, ...], *, allow_non_empty_target: bool) -> None:
@@ -492,7 +689,9 @@ def resolve_publication_author_id(conn: Connection[Any], *, author_id: int | Non
             raise LegacyMigrationImportError(f"No target auth_user found for id {author_id}")
         return author_id
 
-    row_id = scalar(conn, "SELECT id FROM auth_user WHERE username = %s", (username,))
+    row_id = optional_scalar(conn, "SELECT id FROM auth_user WHERE username = %s", (username,))
+    if row_id is None:
+        raise LegacyMigrationImportError(f'No target auth_user found for username "{username}"')
     return int(row_id)
 
 
@@ -637,14 +836,13 @@ def import_symbols(ctx: ImportContext) -> dict[str, int]:
     )
 
     allograph_rows = fetch_rows(legacy_conn, "SELECT id, name, character_id FROM digipal_allograph ORDER BY id")
-
-    allographs = [{"id": -1, "name": "unmapped_allographs", "character_id": 109}]
-    allographs = [] # Remove the breaking row above to pass through symbols phase
-
-    allographs.extend(
+    allographs = [
         {"id": row["id"], "name": text_or_blank(row["name"]), "character_id": row["character_id"]}
         for row in allograph_rows
-    )
+    ]
+    # TODO AG Remove the breaking row above to pass through symbols phase
+    # allographs = []
+
     rows_imported["symbols_structure_allograph"] = insert_rows(
         target_conn,
         """
@@ -824,13 +1022,13 @@ def import_manuscripts(ctx: ImportContext) -> dict[str, int]:
         ],
     )
 
-    ## TODO Add where clause to ignore digipal description without link and pass through manuscript phase
+    #  TODO Add where clause to ignore digipal description without link and pass through manuscript phase
+    # WHERE historical_item_id IS NOT NULL
     description_rows = fetch_rows(
         legacy_conn,
         """
         SELECT id, historical_item_id, source_id, description AS content
         FROM digipal_description
-        WHERE historical_item_id IS NOT NULL
         ORDER BY id
         """,
     )
@@ -1436,6 +1634,8 @@ def import_report_to_dict(report: ImportReport) -> dict[str, Any]:
         "dry_run": report.dry_run,
         "legacy_database": report.legacy_database,
         "target_database": report.target_database,
+        "source_profile": report.source_profile,
+        "source_warnings": report.source_warnings,
         "target_row_counts_before": report.target_row_counts_before,
         "target_row_counts_after": report.target_row_counts_after,
         "phases": [
@@ -1456,6 +1656,27 @@ def import_report_to_dict(report: ImportReport) -> dict[str, Any]:
 
 def render_import_report_json(report: ImportReport) -> str:
     return json.dumps(import_report_to_dict(report), indent=2, sort_keys=True, default=str) + "\n"
+
+
+def audit_failure_summary(audit_dict: dict[str, Any]) -> str:
+    failures: list[str] = []
+    for mapping in audit_dict.get("mappings", []):
+        if mapping.get("status") != "fail":
+            continue
+        comparison = mapping.get("id_comparison") or {}
+        detail_parts = []
+        if comparison.get("unexpected_missing_count"):
+            detail_parts.append(f"unexpected missing: {comparison['unexpected_missing_count']}")
+        if comparison.get("unexpected_extra_count"):
+            detail_parts.append(f"unexpected extra: {comparison['unexpected_extra_count']}")
+        detail = f" ({'; '.join(detail_parts)})" if detail_parts else ""
+        failures.append(f"{mapping.get('key') or mapping.get('title')}{detail}")
+    for check in audit_dict.get("checks", []):
+        if check.get("status") == "fail":
+            failures.append(f"{check.get('key') or check.get('title')}: {check.get('summary')}")
+    if not failures:
+        return "No failed mappings/checks were included in the audit report."
+    return "; ".join(failures[:8])
 
 
 def run_import(options: ImportOptions) -> ImportReport:
@@ -1483,6 +1704,26 @@ def run_import(options: ImportOptions) -> ImportReport:
             require_tables(target_conn, REQUIRED_TARGET_TABLES, database_label=f"target database {target_db}")
         except LegacyMigrationAuditError as exc:
             raise LegacyMigrationImportError(str(exc)) from exc
+
+        source_profile = build_source_profile(legacy_conn)
+        source_warnings = source_profile_warnings(source_profile)
+        execute_blockers = source_profile_blockers(source_profile, phases)
+        if options.execute and "publications" in phases:
+            try:
+                resolve_publication_author_id(
+                    target_conn,
+                    author_id=options.publication_author_id,
+                    username=options.publication_author_username,
+                )
+            except LegacyMigrationImportError as exc:
+                execute_blockers.append(str(exc))
+        if options.execute and execute_blockers:
+            formatted = "\n- ".join(execute_blockers)
+            raise LegacyMigrationImportError(
+                "Source/target preflight blocked execute import before any data was written. "
+                "Run a dry run and review source_profile in the manifest.\n- "
+                f"{formatted}"
+            )
 
         before_counts = target_domain_counts(target_conn)
         if options.execute:
@@ -1549,6 +1790,8 @@ def run_import(options: ImportOptions) -> ImportReport:
         phases=phase_results,
         target_row_counts_before=before_counts,
         target_row_counts_after=after_counts,
+        source_profile=source_profile,
+        source_warnings=source_warnings,
         audit=audit_dict,
     )
     if options.manifest_path:
@@ -1556,7 +1799,10 @@ def run_import(options: ImportOptions) -> ImportReport:
         options.manifest_path.write_text(render_import_report_json(report), encoding="utf-8")
 
     if audit_dict and audit_dict["status"] == "fail":
-        raise LegacyMigrationImportError("Post-import audit completed with status: fail")
+        raise LegacyMigrationImportError(
+            "Post-import audit completed with status: fail. "
+            f"Failed mappings/checks: {audit_failure_summary(audit_dict)}"
+        )
     if audit_dict and audit_dict["status"] == "warn" and not options.allow_warnings:
         raise LegacyMigrationImportError(
             "Post-import audit completed with warnings. Re-run with --allow-warnings after recording them."

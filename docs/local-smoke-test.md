@@ -71,6 +71,16 @@ DOCKER_BIN="$DOCKER_BIN" \
 Expected result: status `warn`, not `fail`. The warning should come from known
 target-only or accepted audit warnings, not from missing tables or failed phases.
 
+This result proves only that connections, required tables, planning queries,
+phase order, and expected counts were resolved. It does not exercise inserts,
+foreign keys, unique constraints, or the post-import audit. Review the planned
+counts against the source before execution.
+
+Also review `source_profile` and `source_warnings` in the dry-run report. If
+the source contains text-only descriptions, unattached descriptions, or broken
+allograph-character links, execute mode will stop before writing until there is
+an explicit migration policy for those rows.
+
 ## Execute
 
 ```bash
@@ -95,6 +105,12 @@ Expected result:
 - `publications`: `ok`
 - `target_only`: `warn` by design
 
+The author username supplied to `--publication-author-username` must already
+exist in this disposable target. If a phase fails, do not clean individual
+tables and continue unless performing an explicitly documented recovery test.
+Discard and recreate the disposable target so that the next trial starts from
+a known empty state.
+
 ## Post-Import Audit
 
 ```bash
@@ -114,3 +130,13 @@ jq -r '.status' reports/local-smoke-post-audit.json
 
 Expected result: `warn`, not `fail`, until all accepted migration warnings have
 been resolved or explicitly signed off.
+
+If the result is `fail`, inspect the failed mappings and checks before changing
+the source or importer:
+
+```bash
+jq '{
+  failed_mappings: [.mappings[] | select(.status == "fail")],
+  failed_checks: [.checks[] | select(.status == "fail")]
+}' reports/local-smoke-post-audit.json
+```

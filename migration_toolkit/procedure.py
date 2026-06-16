@@ -6,7 +6,7 @@ from typing import Any
 
 from migration_toolkit.audit import AuditReport, report_to_dict
 
-PROCEDURE_VERSION = "2026-06-09"
+PROCEDURE_VERSION = "2026-06-16"
 
 
 @dataclass(frozen=True)
@@ -51,8 +51,11 @@ SAFETY_GATES: tuple[SafetyGate, ...] = (
     SafetyGate(
         key="audit_gate",
         title="Read-only audit gate",
-        rule="Run audit_legacy_migration first. Treat fail as a blocker and require sign-off for warnings.",
-        evidence="Manifest stores audit output path, status, and accepted warnings.",
+        rule=(
+            "Run audit_legacy_migration before and after import. An empty-target baseline normally fails for "
+            "missing target rows; after import, fail is a blocker and warnings require sign-off."
+        ),
+        evidence="Manifest stores baseline and post-import audit paths, statuses, and accepted warnings.",
     ),
     SafetyGate(
         key="empty_target_default",
@@ -99,12 +102,13 @@ MIGRATION_PHASES: tuple[MigrationPhase, ...] = (
         target_tables=("Django migration table", "current public schema"),
         importer_contract=(
             "Verify legacy and target URLs are present and point to different databases.",
-            "Run the read-only audit before any write step.",
+            "Run and preserve the read-only baseline audit before any write step.",
+            "Profile source-specific optional relationships and data-quality cases before execution.",
             "Collect target migration state and current domain row counts.",
             "Stop if the target is non-empty unless an explicit audit/update mode is approved.",
         ),
         validation=(
-            "audit_legacy_migration exits without fail status.",
+            "audit_legacy_migration completes and its expected empty-target failures are understood.",
             "showmigrations reports all expected target migrations applied.",
             "Manifest contains operator, environment, source dump, target dump, and approval fields.",
         ),
@@ -186,7 +190,7 @@ MIGRATION_PHASES: tuple[MigrationPhase, ...] = (
         ),
         importer_contract=(
             "Preserve ids for direct vocabularies.",
-            "Keep documented placeholder ids such as allograph -1 explicit.",
+            "Create symbol placeholder rows only when a source-specific policy requires them.",
             "Skip known stale/duplicate rows only when listed in the accepted audit warnings.",
         ),
         validation=(
@@ -566,6 +570,31 @@ def render_procedure_markdown(audit_report: AuditReport | None = None) -> str:
             "The automatic deploy can run tests and the read-only audit; the write importer should require "
             "explicit environment variables, approvals, backups, and a filled manifest.",
             "",
+            "## Command Semantics",
+            "",
+            "- `legacy_migration_procedure` renders instructions and a manifest template; it does not test an import.",
+            "- `audit_legacy_migration` compares source and target contents without writing. Against a fresh empty "
+            "target, `fail` and a non-zero exit are normally expected because source rows are missing from the "
+            "target; the generated report is still the useful baseline evidence.",
+            "- `migrate_legacy_data` without `--execute` validates connections, tables, planning queries, phase "
+            "order, and planned counts. It does not test inserts or target constraints.",
+            "- `migrate_legacy_data --execute` writes supported mappings and then runs the post-import audit.",
+            "- A post-import `fail` is a blocker. `--allow-warnings` accepts reviewed warnings only and never "
+            "accepts `fail`.",
+            "- `--publication-author-username` must name an existing target `auth_user`; the importer does not "
+            "create that user.",
+            "",
+            "## Source Database Variability",
+            "",
+            "DigiPal databases can share a schema while containing different identifiers, optional relationships, "
+            "vocabularies, and data-quality cases. The checked-in audit describes one inspected source snapshot, "
+            "not every DigiPal installation. Review every new source independently and do not silently remove rows "
+            "to make an import pass.",
+            "",
+            "Legacy `digipal_description` rows may refer to a historical item or to a text. The current importer "
+            "supports historical-item descriptions. Text-only descriptions and rows linked to neither entity "
+            "require an explicit mapping, quarantine, or approved exclusion policy before execution.",
+            "",
             "## Safety Gates",
             "",
             "| Gate | Rule | Evidence |",
@@ -613,6 +642,7 @@ def render_procedure_markdown(audit_report: AuditReport | None = None) -> str:
             "",
             "- CI should run unit tests for the audit/procedure modules.",
             "- Pre-cutover should run `audit_legacy_migration`; fail status blocks the deployment.",
+            "  This refers to the populated target after import, not the expected empty-target baseline.",
             "- Warning status requires a human to list accepted warnings in the manifest.",
             "- `migrate_legacy_data` plans by default and writes only with `--execute`.",
             "- The write import should run against a freshly migrated target unless "
@@ -645,6 +675,9 @@ def render_procedure_markdown(audit_report: AuditReport | None = None) -> str:
             "  --manifest reports/legacy-migration-import-dry-run.json",
             "```",
             "",
+            "A successful dry run proves that the import can be planned. It does not prove that inserts, foreign "
+            "keys, unique constraints, or post-import comparisons will pass.",
+            "",
             "Execute only against a backed-up, freshly migrated target database:",
             "",
             "```bash",
@@ -655,6 +688,9 @@ def render_procedure_markdown(audit_report: AuditReport | None = None) -> str:
             "  --allow-warnings \\",
             "  --manifest reports/legacy-migration-import-run.json",
             "```",
+            "",
+            "The publication author username must already exist in the target database. `--allow-warnings` permits "
+            "reviewed warning status but never permits fail status.",
             "",
             "The command refuses same-database URLs, missing tables, and non-empty import targets by default. "
             "Use `--allow-non-empty-target` only for an approved recovery or incremental trial.",
