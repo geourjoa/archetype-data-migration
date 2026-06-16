@@ -246,6 +246,8 @@ against host Python.
    - Check FK integrity.
    - Check target constraints.
    - Run focused application tests.
+   - Between full trials, recreate the disposable target database rather than
+     deleting target table rows by hand.
 
 7. Rebuild derived systems.
    - Run migrations.
@@ -274,6 +276,16 @@ The current target mapping and importer support historical-item descriptions.
 Text-only descriptions and rows linked to neither entity require an explicit
 policy before execution. They must not be silently discarded merely to satisfy
 target constraints.
+
+The importer default is `--unsupported-description-policy fail`, which stops an
+execute run before any write if text-only, unattached, or dangling description
+rows are present. If the project decides those rows should be excluded from the
+target historical-item description table, rerun with
+`--unsupported-description-policy skip`. That policy imports only descriptions
+linked to an existing historical item and records skipped row counts in the
+manifest/import report. When `--manifest` is provided, the importer also writes
+a sibling `*-skipped-descriptions.json` quarantine artifact containing every
+skipped row and the reason it was excluded.
 
 Use this source-side query during preflight:
 
@@ -314,6 +326,20 @@ Machine-readable audit:
   --output reports/legacy-migration-audit.json
 ```
 
+Post-import audit for an approved fallback publication author:
+
+```bash
+./scripts/backend-compose-run.sh python -m commands.audit_legacy_migration \
+  --format json \
+  --publication-author-policy fallback \
+  --publication-author-username <target-author-username> \
+  --output reports/legacy-migration-post-audit.json
+```
+
+This does not hide the author decision. It reports `publication_author_mapping`
+as an explicit fallback-author warning with the legacy author breakdown attached
+for sign-off.
+
 CI-style strict audit:
 
 ```bash
@@ -350,6 +376,12 @@ Execute against a freshly migrated, backed-up target database:
 command does not create that user. `--allow-warnings` permits reviewed audit
 warnings but never permits a final `fail` status.
 
+When unsupported description rows have an approved exclusion policy, add
+`--unsupported-description-policy skip` to both dry-run and execute commands so
+the planned/imported row counts match the intended migration scope. Keep the
+generated `*-skipped-descriptions.json` quarantine artifact with the run
+evidence.
+
 For partial trial runs, repeat `--phase`, for example:
 
 ```bash
@@ -359,6 +391,19 @@ For partial trial runs, repeat `--phase`, for example:
   --publication-author-username <target-author-username> \
   --skip-post-audit
 ```
+
+Recreate a disposable target between full trials:
+
+```bash
+./scripts/backend-compose-run.sh python -m commands.recreate_disposable_target \
+  --database-name legacy_import_trial_YYYYMMDD \
+  --confirm-name legacy_import_trial_YYYYMMDD \
+  --execute \
+  --manifest reports/legacy_import_trial_YYYYMMDD-recreate.json
+```
+
+After this command, run backend migrations and recreate/verify the target
+publication author before importing again.
 
 ## Implementation Notes
 
@@ -372,6 +417,13 @@ For partial trial runs, repeat `--phase`, for example:
 - Require an explicit publication author policy.
 - Save an import report/manifest and final audit output.
 - Refuse to run if `legacy_url` and `target_url` point at the same database.
+
+`recreate_disposable_target` is the guarded trial reset helper. It:
+
+- Refuses protected or normal database names by default.
+- Requires `--execute` and an exact `--confirm-name` before dropping anything.
+- Drops and recreates the entire disposable database; it does not delete rows
+  from a populated target in place.
 
 The importer has been smoke-tested against a disposable, freshly migrated
 target database using the specific inspected legacy snapshot. The successful

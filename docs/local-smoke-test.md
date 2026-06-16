@@ -58,6 +58,25 @@ Create a fallback publication author in the disposable target:
   api python manage.py shell -c "from django.contrib.auth import get_user_model; User = get_user_model(); User.objects.get_or_create(username='legacy-import-author', defaults={'email': 'legacy-import-author@example.invalid', 'is_staff': True})"
 ```
 
+## Recreate A Disposable Target
+
+For repeat trials, recreate the disposable database instead of deleting target
+table rows by hand:
+
+```bash
+TARGET_DATABASE_URL="$TARGET_DATABASE_URL" \
+DOCKER_BIN="$DOCKER_BIN" \
+./scripts/backend-compose-run.sh python -m commands.recreate_disposable_target \
+  --database-name "$SMOKE_DB" \
+  --confirm-name "$SMOKE_DB" \
+  --execute \
+  --manifest "reports/${SMOKE_DB}-recreate.json"
+```
+
+The command refuses normal database names by default. After it recreates the
+empty database, rerun backend migrations and recreate/verify the fallback
+publication author before starting the next dry run.
+
 ## Dry Run
 
 ```bash
@@ -80,6 +99,12 @@ Also review `source_profile` and `source_warnings` in the dry-run report. If
 the source contains text-only descriptions, unattached descriptions, or broken
 allograph-character links, execute mode will stop before writing until there is
 an explicit migration policy for those rows.
+
+For a source where unsupported description rows have been reviewed and approved
+for exclusion, add `--unsupported-description-policy skip` to both dry-run and
+execute commands. The report will record skipped `digipal_description` rows and
+write a sibling `*-skipped-descriptions.json` quarantine artifact when
+`--manifest` is provided.
 
 ## Execute
 
@@ -119,6 +144,8 @@ LEGACY_DATABASE_NAME="$LEGACY_DATABASE_NAME" \
 DOCKER_BIN="$DOCKER_BIN" \
 ./scripts/backend-compose-run.sh python -m commands.audit_legacy_migration \
   --format json \
+  --publication-author-policy fallback \
+  --publication-author-username legacy-import-author \
   --output reports/local-smoke-post-audit.json
 ```
 

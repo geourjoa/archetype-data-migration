@@ -4,7 +4,8 @@
     "allow_non_empty_target": false,
     "approved_at": "",
     "approved_by": "",
-    "author_policy": ""
+    "author_policy": "",
+    "unsupported_description_policy": "fail"
   },
   "audit": {
     "legacy_database": "",
@@ -187,6 +188,9 @@
     }
   ],
   "procedure_version": "2026-06-16",
+  "quarantine_artifacts": {
+    "unsupported_descriptions": ""
+  },
   "schema_version": 1,
   "target": {
     "database_url_env": "TARGET_DATABASE_URL or DATABASE_URL",

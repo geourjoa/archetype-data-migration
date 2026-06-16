@@ -25,14 +25,18 @@ This migration should be a manual deployment lane, not an automatic step on ever
 - `audit_legacy_migration` compares source and target contents without writing. Against a fresh empty target, `fail` and a non-zero exit are normally expected because source rows are missing from the target; the generated report is still the useful baseline evidence.
 - `migrate_legacy_data` without `--execute` validates connections, tables, planning queries, phase order, and planned counts. It does not test inserts or target constraints.
 - `migrate_legacy_data --execute` writes supported mappings and then runs the post-import audit.
+- `recreate_disposable_target` drops and recreates only explicitly named disposable trial databases; it is not a generic target-table cleanup command.
 - A post-import `fail` is a blocker. `--allow-warnings` accepts reviewed warnings only and never accepts `fail`.
+- `--unsupported-description-policy fail` is the default. Use `skip` only when text-only, unattached, or dangling `digipal_description` rows have been reviewed and accepted as excluded.
+- When unsupported descriptions are skipped and `--manifest` is provided, the importer writes a sibling `*-skipped-descriptions.json` quarantine artifact with every skipped row.
 - `--publication-author-username` must name an existing target `auth_user`; the importer does not create that user.
+- If the publications phase uses a fallback author, post-import audit should use `--publication-author-policy fallback` with the same target user so the manifest records the decision explicitly.
 
 ## Source Database Variability
 
 DigiPal databases can share a schema while containing different identifiers, optional relationships, vocabularies, and data-quality cases. The checked-in audit describes one inspected source snapshot, not every DigiPal installation. Review every new source independently and do not silently remove rows to make an import pass.
 
-Legacy `digipal_description` rows may refer to a historical item or to a text. The current importer supports historical-item descriptions. Text-only descriptions and rows linked to neither entity require an explicit mapping, quarantine, or approved exclusion policy before execution.
+Legacy `digipal_description` rows may refer to a historical item or to a text. The current importer supports historical-item descriptions. Text-only descriptions and rows linked to neither entity require an explicit mapping, quarantine, or approved exclusion policy before execution. When the approved decision is exclusion, run with `--unsupported-description-policy skip`; the report records the selected policy, skipped row counts, and a quarantine artifact when `--manifest` is provided.
 
 ## Safety Gates
 
@@ -43,7 +47,9 @@ Legacy `digipal_description` rows may refer to a historical item or to a text. T
 | Refuse same source and target | The legacy URL and target URL must resolve to different database names. | Preflight/audit exits before import when the names match. |
 | Read-only audit gate | Run audit_legacy_migration before and after import. An empty-target baseline normally fails for missing target rows; after import, fail is a blocker and warnings require sign-off. | Manifest stores baseline and post-import audit paths, statuses, and accepted warnings. |
 | Empty target by default | Run the write importer only against a freshly migrated target DB unless explicitly approved. | Preflight row-count report is attached to the manifest. |
+| Guarded disposable reset | Recreate whole disposable trial databases instead of deleting target tables by hand. | Reset report records the disposable database name, confirmation, and follow-up migration steps. |
 | Publication author policy | Do not map publication authors by legacy numeric id. Use username/email mapping or a fallback author. | Manifest records the chosen author policy and sample resolved posts. |
+| Unsupported description policy | Treat text-only, unattached, or dangling legacy descriptions as explicit migration policy decisions. Do not skip them unless the skipped rows are reviewed and recorded. | Import report records source_profile counts, the selected unsupported-description policy, and skipped rows. |
 | Transaction per phase | Each import phase must be atomic and independently auditable. | Manifest records phase start/end time, status, row counts, and rollback reference. |
 | Reset sequences after explicit ids | Run sequence synchronization after id-preserving imports and before application writes resume. | Manifest records just sync-sequences output or equivalent SQL result. |
 | Target-only data is not legacy data | Create current-only workflow/product rows only from current-system sources, never by guessing legacy source data. | Manifest records skipped target-only tables or the approved current-system source for each. |
@@ -78,6 +84,7 @@ Importer contract:
 - Profile source-specific optional relationships and data-quality cases before execution.
 - Collect target migration state and current domain row counts.
 - Stop if the target is non-empty unless an explicit audit/update mode is approved.
+- For repeat trials, recreate only explicitly named disposable target databases.
 
 Validation:
 - audit_legacy_migration completes and its expected empty-target failures are understood.
@@ -109,6 +116,7 @@ Importer contract:
 - Map legacy users by username/email, or select one explicit fallback author.
 - Do not rely on numeric legacy auth_user ids in a fresh target.
 - Record original legacy username/email where the fallback author is used.
+- Run post-import audit with the same fallback-author policy when a fallback author is selected.
 
 Validation:
 - Publication author audit warning is either eliminated or explicitly accepted.
@@ -152,6 +160,7 @@ Import manuscript hierarchy and IIIF-backed item images.
 
 Importer contract:
 - Preserve ids for current items, historical items, descriptions, catalogue numbers, item parts, and images.
+- Fail on unsupported digipal_description relationships unless an explicit skip policy is approved.
 - Create the documented -1 item-part placeholder only if needed.
 - Validate shortened shelfmark/current locus fields before insert.
 
@@ -279,6 +288,7 @@ Rollback: Restore the pre-cutover target dump and return traffic to the previous
 - Warning status requires a human to list accepted warnings in the manifest.
 - `migrate_legacy_data` plans by default and writes only with `--execute`.
 - The write import should run against a freshly migrated target unless `--allow-non-empty-target` is explicitly approved.
+- Trial resets should recreate a disposable target database and then rerun backend migrations.
 - Post-cutover should run sequence sync, focused tests, smoke checks, and search rebuild.
 
 ## Command Reference
@@ -301,6 +311,12 @@ Rollback: Restore the pre-cutover target dump and return traffic to the previous
 ./scripts/backend-compose-run.sh python -m commands.audit_legacy_migration --format markdown --output reports/legacy-migration-audit.md
 ```
 
+### Write the post-import audit with fallback publication author policy
+
+```bash
+./scripts/backend-compose-run.sh python -m commands.audit_legacy_migration --format markdown --publication-author-policy fallback --publication-author-username <target-author-username> --output reports/legacy-migration-post-audit.md
+```
+
 ### Plan the legacy import without writing data
 
 ```bash
@@ -311,6 +327,12 @@ Rollback: Restore the pre-cutover target dump and return traffic to the previous
 
 ```bash
 ./scripts/backend-compose-run.sh python -m commands.migrate_legacy_data --execute --publication-author-username <target-author-username> --allow-warnings --manifest reports/legacy-migration-import-run.json
+```
+
+### Recreate a disposable target between trials
+
+```bash
+./scripts/backend-compose-run.sh python -m commands.recreate_disposable_target --database-name legacy_import_trial_YYYYMMDD --confirm-name legacy_import_trial_YYYYMMDD --execute --manifest reports/legacy_import_trial_YYYYMMDD-recreate.json
 ```
 
 ### Run strict audit in CI or pre-cutover
@@ -361,4 +383,8 @@ Execute only against a backed-up, freshly migrated target database:
 
 The publication author username must already exist in the target database. `--allow-warnings` permits reviewed warning status but never permits fail status.
 
+If the source profile reports text-only, unattached, or dangling `digipal_description` rows, the default execute mode stops before writing. To run after an approved exclusion decision, add `--unsupported-description-policy skip`; the command then imports only descriptions linked to an existing historical item and records skipped rows in the manifest. With `--manifest`, the command also writes a sibling `*-skipped-descriptions.json` quarantine artifact.
+
 The command refuses same-database URLs, missing tables, and non-empty import targets by default. Use `--allow-non-empty-target` only for an approved recovery or incremental trial.
+
+For repeat trials, use `recreate_disposable_target` on an explicitly named disposable database. After recreating it, apply backend migrations and recreate/verify the target publication author.

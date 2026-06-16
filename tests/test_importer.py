@@ -4,16 +4,22 @@ import pytest
 
 from commands.migrate_legacy_data import main as migrate_main
 from migration_toolkit.importer import (
+    DESCRIPTION_POLICY_SKIP,
     ImportReport,
     LegacyMigrationImportError,
     PhaseResult,
     audit_failure_summary,
+    default_unsupported_description_output_path,
     expand_phases,
+    import_report_to_dict,
     legacy_image_path,
     parse_annotation,
     parse_date_weights,
     source_profile_blockers,
     source_profile_warnings,
+    unsupported_description_count,
+    unsupported_description_export_to_dict,
+    write_unsupported_description_export,
 )
 
 
@@ -55,6 +61,8 @@ def test_migrate_legacy_data_cli_renders_report(monkeypatch, capsys):
     def fake_run_import(options):
         assert options.execute is False
         assert options.phases == ("manuscripts",)
+        assert options.unsupported_description_policy == DESCRIPTION_POLICY_SKIP
+        assert options.unsupported_description_output_path.name == "skipped.json"
         return ImportReport(
             dry_run=True,
             legacy_database="legacy_source",
@@ -75,7 +83,19 @@ def test_migrate_legacy_data_cli_renders_report(monkeypatch, capsys):
 
     monkeypatch.setattr("commands.migrate_legacy_data.run_import", fake_run_import)
 
-    assert migrate_main(["--phase", "manuscripts"]) == 0
+    assert (
+        migrate_main(
+            [
+                "--phase",
+                "manuscripts",
+                "--unsupported-description-policy",
+                "skip",
+                "--unsupported-description-output",
+                "skipped.json",
+            ]
+        )
+        == 0
+    )
     output = capsys.readouterr().out
     data = json.loads(output)
 
@@ -123,8 +143,43 @@ def test_source_profile_blockers_apply_to_selected_phases():
 
     assert source_profile_blockers(profile, ("image_text",)) == []
     assert len(source_profile_blockers(profile, ("manuscripts",))) == 1
+    assert (
+        source_profile_blockers(
+            profile,
+            ("manuscripts",),
+            unsupported_description_policy=DESCRIPTION_POLICY_SKIP,
+        )
+        == []
+    )
     assert len(source_profile_blockers(profile, ("symbols",))) == 1
     assert len(source_profile_blockers(profile, ("symbols", "manuscripts"))) == 2
+    assert (
+        len(
+            source_profile_blockers(
+                profile,
+                ("symbols", "manuscripts"),
+                unsupported_description_policy=DESCRIPTION_POLICY_SKIP,
+            )
+        )
+        == 1
+    )
+
+
+def test_unsupported_description_count_excludes_both_link_rows():
+    profile = {
+        "description_relationships": {
+            "counts": {
+                "historical_only": 10,
+                "text_only": 2,
+                "both_links": 99,
+                "neither_link": 3,
+                "dangling_historical_item": 4,
+            },
+            "samples": {},
+        }
+    }
+
+    assert unsupported_description_count(profile) == 9
 
 
 def test_import_report_status_warns_on_source_warnings():
@@ -139,6 +194,111 @@ def test_import_report_status_warns_on_source_warnings():
     )
 
     assert report.status == "warn"
+
+
+def test_import_report_records_policies_and_skipped_rows():
+    report = ImportReport(
+        dry_run=False,
+        legacy_database="legacy_source",
+        target_database="new_target",
+        phases=[
+            PhaseResult(
+                key="manuscripts",
+                status="warn",
+                started_at="2026-06-09T00:00:00+00:00",
+                finished_at="2026-06-09T00:00:01+00:00",
+                rows_planned={"manuscripts_historicalitemdescription": 10},
+                rows_imported={"manuscripts_historicalitemdescription": 8},
+                rows_skipped={"digipal_description": 2},
+                warnings=["Skipped unsupported digipal_description rows by explicit policy."],
+            )
+        ],
+        target_row_counts_before={},
+        target_row_counts_after={},
+        import_policies={"unsupported_description_policy": DESCRIPTION_POLICY_SKIP},
+        generated_artifacts=[
+            {
+                "type": "unsupported_digipal_descriptions",
+                "path": "reports/import-skipped-descriptions.json",
+                "row_count": 2,
+            }
+        ],
+    )
+
+    data = import_report_to_dict(report)
+
+    assert data["status"] == "warn"
+    assert data["import_policies"]["unsupported_description_policy"] == "skip"
+    assert data["generated_artifacts"][0]["type"] == "unsupported_digipal_descriptions"
+    assert data["phases"][0]["rows_skipped"] == {"digipal_description": 2}
+
+
+def test_default_unsupported_description_output_path_uses_manifest_stem(tmp_path):
+    manifest_path = tmp_path / "legacy-migration-import-dry-run.json"
+
+    assert default_unsupported_description_output_path(manifest_path) == (
+        tmp_path / "legacy-migration-import-dry-run-skipped-descriptions.json"
+    )
+    assert default_unsupported_description_output_path(None) is None
+
+
+def test_unsupported_description_export_groups_reason_counts():
+    rows = [
+        {
+            "id": 1,
+            "historical_item_id": None,
+            "text_id": 10,
+            "source_id": 6,
+            "source_name": "Catalogue",
+            "content": "Text-linked description",
+            "reason": "text_only",
+        },
+        {
+            "id": 2,
+            "historical_item_id": None,
+            "text_id": None,
+            "source_id": 6,
+            "source_name": "Catalogue",
+            "content": "Unattached description",
+            "reason": "neither_link",
+        },
+    ]
+
+    data = unsupported_description_export_to_dict(
+        legacy_database="legacy_source",
+        target_database="target_current",
+        generated_at="2026-06-16T00:00:00+00:00",
+        rows=rows,
+    )
+
+    assert data["row_count"] == 2
+    assert data["reason_counts"] == {"text_only": 1, "neither_link": 1}
+    assert data["rows"][0]["content"] == "Text-linked description"
+
+
+def test_write_unsupported_description_export_writes_json(tmp_path):
+    output_path = tmp_path / "skipped.json"
+
+    write_unsupported_description_export(
+        output_path,
+        legacy_database="legacy_source",
+        target_database="target_current",
+        rows=[
+            {
+                "id": 1,
+                "historical_item_id": None,
+                "text_id": 10,
+                "source_id": 6,
+                "source_name": "Catalogue",
+                "content": "Text-linked description",
+                "reason": "text_only",
+            }
+        ],
+    )
+
+    data = json.loads(output_path.read_text(encoding="utf-8"))
+    assert data["artifact_type"] == "unsupported_digipal_descriptions"
+    assert data["row_count"] == 1
 
 
 def test_audit_failure_summary_includes_failed_mapping_counts():

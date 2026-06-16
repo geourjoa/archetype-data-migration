@@ -68,6 +68,7 @@ just procedure
 just audit
 just dry-run-import
 just execute-import <target-author-username>
+just recreate-disposable-target <disposable-db-name>
 ```
 
 The commands have different purposes:
@@ -98,6 +99,26 @@ fields before executing; execution is blocked before any writes when the current
 source contains unsupported description relationships, broken allograph-character
 links, or a missing publication author policy.
 
+If the publications phase intentionally uses one fallback author, run post-import
+audit with the same policy so the warning records the decision instead of only
+showing a legacy numeric-ID mismatch:
+
+```bash
+./scripts/backend-compose-run.sh python -m commands.audit_legacy_migration \
+  --publication-author-policy fallback \
+  --publication-author-username <target-author-username>
+```
+
+Unsupported description relationships default to `fail`. If text-only,
+unattached, or dangling `digipal_description` rows have been reviewed and the
+approved decision is to exclude them from `manuscripts_historicalitemdescription`,
+run the importer with `--unsupported-description-policy skip`. The import report
+then records the selected policy and skipped row counts. When `--manifest` is
+provided, the importer also writes a sibling
+`*-skipped-descriptions.json` quarantine artifact containing every skipped row
+and its reason. Do not use this flag until those rows are reviewed and the
+artifact is listed in the run manifest.
+
 Equivalent direct Compose commands:
 
 ```bash
@@ -116,6 +137,18 @@ Equivalent direct Compose commands:
 Write imports require `--execute` and should only run after backups, audit review, and manifest sign-off.
 
 For a disposable local execute test, follow [local-smoke-test.md](docs/local-smoke-test.md). Do not commit local database dumps or generated run reports unless the team explicitly wants them preserved as reviewed evidence.
+
+For repeated trials, prefer recreating a disposable target database rather than
+manually deleting rows from target tables:
+
+```bash
+just recreate-disposable-target legacy_import_trial_YYYYMMDD
+```
+
+The helper refuses normal database names by default and requires explicit
+confirmation internally. After it recreates the empty database, apply backend
+Django migrations and recreate/verify the target publication author before
+running the dry-run or execute importer again.
 
 ## Backend Version Contract
 
