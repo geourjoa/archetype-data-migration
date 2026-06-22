@@ -24,6 +24,40 @@ class LegacyMigrationAuditError(RuntimeError):
     pass
 
 
+PUBLICATION_AUTHOR_POLICY_LEGACY_ID = "legacy-id"
+PUBLICATION_AUTHOR_POLICY_FALLBACK = "fallback"
+PUBLICATION_AUTHOR_POLICIES: tuple[str, ...] = (
+    PUBLICATION_AUTHOR_POLICY_LEGACY_ID,
+    PUBLICATION_AUTHOR_POLICY_FALLBACK,
+)
+
+SUPPORTED_HISTORICAL_DESCRIPTION_COUNT_SQL = """
+SELECT count(*)
+FROM digipal_description d
+WHERE d.historical_item_id IS NOT NULL
+  AND EXISTS (
+    SELECT 1 FROM digipal_historicalitem h WHERE h.id = d.historical_item_id
+  )
+"""
+
+SUPPORTED_HISTORICAL_DESCRIPTION_IDS_SQL = """
+SELECT d.id
+FROM digipal_description d
+WHERE d.historical_item_id IS NOT NULL
+  AND EXISTS (
+    SELECT 1 FROM digipal_historicalitem h WHERE h.id = d.historical_item_id
+  )
+ORDER BY d.id
+"""
+
+
+@dataclass(frozen=True)
+class PublicationAuthorPolicy:
+    mode: str = PUBLICATION_AUTHOR_POLICY_LEGACY_ID
+    fallback_author_id: int | None = None
+    fallback_author_username: str | None = None
+
+
 @dataclass(frozen=True)
 class EntityMapping:
     key: str
@@ -169,8 +203,13 @@ ENTITY_MAPPINGS: tuple[EntityMapping, ...] = (
         legacy_table="digipal_description",
         target_table="manuscripts_historicalitemdescription",
         category="manuscripts",
-        strategy="id-preserved transformed fields",
-        notes="Legacy description.description maps to target content.",
+        strategy="id-preserved supported historical-item descriptions",
+        notes=(
+            "Only descriptions linked to an existing historical item can become target HistoricalItemDescription "
+            "rows. Text-only, unattached, or dangling source descriptions require explicit review."
+        ),
+        legacy_count_sql=SUPPORTED_HISTORICAL_DESCRIPTION_COUNT_SQL,
+        legacy_ids_sql=SUPPORTED_HISTORICAL_DESCRIPTION_IDS_SQL,
     ),
     EntityMapping(
         key="catalogue_numbers",
@@ -519,9 +558,13 @@ def _scalar(conn: Connection[Any], query: str | sql.Composed) -> Any:
     return row[0]
 
 
-def _dict_rows(conn: Connection[Any], query: str | sql.Composed) -> list[dict[str, Any]]:
+def _dict_rows(
+    conn: Connection[Any],
+    query: str | sql.Composed,
+    params: tuple[Any, ...] | dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
     with conn.cursor(row_factory=dict_row) as cursor:
-        cursor.execute(query)
+        cursor.execute(query, params)
         return list(cursor.fetchall())
 
 
@@ -644,9 +687,9 @@ def require_tables(conn: Connection[Any], tables: set[str], *, database_label: s
         raise LegacyMigrationAuditError(f"{database_label} is missing required tables: {', '.join(missing)}")
 
 
-def check_publication_author_mapping(legacy_conn: Connection[Any], target_conn: Connection[Any]) -> CheckResult:
-    legacy_rows = _dict_rows(
-        legacy_conn,
+def legacy_publication_authors(conn: Connection[Any]) -> list[dict[str, Any]]:
+    return _dict_rows(
+        conn,
         """
         SELECT b.user_id AS id, u.username, count(*) AS post_count
         FROM blog_blogpost b
@@ -655,8 +698,11 @@ def check_publication_author_mapping(legacy_conn: Connection[Any], target_conn: 
         ORDER BY b.user_id
         """,
     )
-    target_rows = _dict_rows(
-        target_conn,
+
+
+def target_publication_authors(conn: Connection[Any]) -> list[dict[str, Any]]:
+    return _dict_rows(
+        conn,
         """
         SELECT p.author_id AS id, u.username, count(*) AS post_count
         FROM publications_publication p
@@ -665,6 +711,109 @@ def check_publication_author_mapping(legacy_conn: Connection[Any], target_conn: 
         ORDER BY p.author_id
         """,
     )
+
+
+def target_author_row(conn: Connection[Any], policy: PublicationAuthorPolicy) -> dict[str, Any] | None:
+    if policy.fallback_author_id is not None:
+        rows = _dict_rows(
+            conn,
+            "SELECT id, username FROM auth_user WHERE id = %s",
+            (policy.fallback_author_id,),
+        )
+        return rows[0] if rows else None
+    if policy.fallback_author_username:
+        rows = _dict_rows(
+            conn,
+            "SELECT id, username FROM auth_user WHERE username = %s",
+            (policy.fallback_author_username,),
+        )
+        return rows[0] if rows else None
+    return None
+
+
+def check_publication_fallback_author_policy(
+    legacy_conn: Connection[Any],
+    target_conn: Connection[Any],
+    policy: PublicationAuthorPolicy,
+) -> CheckResult:
+    expected_author = target_author_row(target_conn, policy)
+    legacy_rows = legacy_publication_authors(legacy_conn)
+    target_rows = target_publication_authors(target_conn)
+    details = [
+        {
+            "policy": {
+                "mode": policy.mode,
+                "fallback_author_id": policy.fallback_author_id,
+                "fallback_author_username": policy.fallback_author_username,
+            },
+            "expected_target_author": expected_author,
+            "legacy_authors": legacy_rows,
+            "target_authors": target_rows,
+        }
+    ]
+
+    if not expected_author:
+        return CheckResult(
+            key="publication_author_mapping",
+            title="Publication author mapping",
+            status="fail",
+            summary="Fallback publication author policy is selected, but the target author was not found.",
+            details=details,
+        )
+
+    unexpected_target_authors = [row for row in target_rows if row["id"] != expected_author["id"]]
+    if unexpected_target_authors:
+        return CheckResult(
+            key="publication_author_mapping",
+            title="Publication author mapping",
+            status="fail",
+            summary=(
+                "Fallback publication author policy expected every imported publication to use "
+                f"{expected_author['username']}, but other target authors are present."
+            ),
+            details=details,
+        )
+
+    legacy_publication_count = sum(int(row["post_count"] or 0) for row in legacy_rows)
+    target_publication_count = sum(int(row["post_count"] or 0) for row in target_rows)
+    if legacy_publication_count != target_publication_count:
+        return CheckResult(
+            key="publication_author_mapping",
+            title="Publication author mapping",
+            status="fail",
+            summary=(
+                "Fallback publication author policy is selected, but source/target publication counts differ: "
+                f"{legacy_publication_count} legacy rows and {target_publication_count} target rows."
+            ),
+            details=details,
+        )
+
+    return CheckResult(
+        key="publication_author_mapping",
+        title="Publication author mapping",
+        status="warn",
+        summary=(
+            "Explicit fallback publication author policy applied: "
+            f"{target_publication_count} publications assigned to target user {expected_author['username']}. "
+            "Legacy author identities are preserved in this audit detail for operator sign-off."
+        ),
+        details=details,
+    )
+
+
+def check_publication_author_mapping(
+    legacy_conn: Connection[Any],
+    target_conn: Connection[Any],
+    policy: PublicationAuthorPolicy | None = None,
+) -> CheckResult:
+    policy = policy or PublicationAuthorPolicy()
+    if policy.mode == PUBLICATION_AUTHOR_POLICY_FALLBACK:
+        return check_publication_fallback_author_policy(legacy_conn, target_conn, policy)
+    if policy.mode != PUBLICATION_AUTHOR_POLICY_LEGACY_ID:
+        raise LegacyMigrationAuditError(f"Unsupported publication author policy: {policy.mode}")
+
+    legacy_rows = legacy_publication_authors(legacy_conn)
+    target_rows = target_publication_authors(target_conn)
     target_by_id = {row["id"]: row for row in target_rows}
     mismatches: list[dict[str, Any]] = []
     for legacy_row in legacy_rows:
@@ -706,6 +855,50 @@ def check_publication_author_mapping(legacy_conn: Connection[Any], target_conn: 
         title="Publication author mapping",
         status="ok",
         summary="Publication author ids resolve to matching usernames.",
+    )
+
+
+def check_legacy_description_relationships(legacy_conn: Connection[Any]) -> CheckResult:
+    rows = _dict_rows(
+        legacy_conn,
+        """
+        SELECT
+          count(*) FILTER (WHERE historical_item_id IS NOT NULL AND text_id IS NULL) AS historical_only,
+          count(*) FILTER (WHERE historical_item_id IS NULL AND text_id IS NOT NULL) AS text_only,
+          count(*) FILTER (WHERE historical_item_id IS NOT NULL AND text_id IS NOT NULL) AS both_links,
+          count(*) FILTER (WHERE historical_item_id IS NULL AND text_id IS NULL) AS neither_link,
+          count(*) FILTER (
+            WHERE historical_item_id IS NOT NULL
+              AND NOT EXISTS (
+                SELECT 1 FROM digipal_historicalitem h WHERE h.id = digipal_description.historical_item_id
+              )
+          ) AS dangling_historical_item
+        FROM digipal_description
+        """,
+    )
+    counts = {key: int(value or 0) for key, value in rows[0].items()}
+    unsupported = counts["text_only"] + counts["neither_link"] + counts["dangling_historical_item"]
+    supported = counts["historical_only"] + counts["both_links"] - counts["dangling_historical_item"]
+    details = [{"supported_historical_descriptions": supported, "unsupported_descriptions": unsupported, **counts}]
+
+    if unsupported:
+        return CheckResult(
+            key="legacy_description_relationships",
+            title="Legacy description relationships",
+            status="warn",
+            summary=(
+                f"{supported} legacy descriptions are supported historical-item descriptions; "
+                f"{unsupported} text-only, unattached, or dangling descriptions require review/quarantine."
+            ),
+            details=details,
+        )
+
+    return CheckResult(
+        key="legacy_description_relationships",
+        title="Legacy description relationships",
+        status="ok",
+        summary=f"{supported} legacy descriptions are supported historical-item descriptions.",
+        details=details,
     )
 
 
@@ -801,7 +994,11 @@ def check_legacy_text_exclusions(legacy_conn: Connection[Any], target_conn: Conn
     )
 
 
-def run_audit(legacy_url: str | None = None, target_url: str | None = None) -> AuditReport:
+def run_audit(
+    legacy_url: str | None = None,
+    target_url: str | None = None,
+    publication_author_policy: PublicationAuthorPolicy | None = None,
+) -> AuditReport:
     legacy_url = legacy_url or legacy_url_from_env()
     target_url = target_url or target_url_from_env()
 
@@ -833,7 +1030,8 @@ def run_audit(legacy_url: str | None = None, target_url: str | None = None) -> A
 
         mappings = [audit_mapping(legacy_conn, target_conn, mapping) for mapping in ENTITY_MAPPINGS]
         checks = [
-            check_publication_author_mapping(legacy_conn, target_conn),
+            check_legacy_description_relationships(legacy_conn),
+            check_publication_author_mapping(legacy_conn, target_conn, publication_author_policy),
             check_annotation_shape(legacy_conn, target_conn),
             check_legacy_text_exclusions(legacy_conn, target_conn),
         ]

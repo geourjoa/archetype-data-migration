@@ -25,7 +25,7 @@ def test_render_procedure_json_is_machine_readable():
     rendered = render_procedure_json()
     data = json.loads(rendered)
 
-    assert data["procedure_version"] == "2026-06-09"
+    assert data["procedure_version"] == "2026-06-16"
     assert data["phases"][0]["key"] == "00_preflight"
     assert any(gate["key"] == "audit_gate" for gate in data["safety_gates"])
 

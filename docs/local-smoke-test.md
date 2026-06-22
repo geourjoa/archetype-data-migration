@@ -58,6 +58,25 @@ Create a fallback publication author in the disposable target:
   api python manage.py shell -c "from django.contrib.auth import get_user_model; User = get_user_model(); User.objects.get_or_create(username='legacy-import-author', defaults={'email': 'legacy-import-author@example.invalid', 'is_staff': True})"
 ```
 
+## Recreate A Disposable Target
+
+For repeat trials, recreate the disposable database instead of deleting target
+table rows by hand:
+
+```bash
+TARGET_DATABASE_URL="$TARGET_DATABASE_URL" \
+DOCKER_BIN="$DOCKER_BIN" \
+./scripts/backend-compose-run.sh python -m commands.recreate_disposable_target \
+  --database-name "$SMOKE_DB" \
+  --confirm-name "$SMOKE_DB" \
+  --execute \
+  --manifest "reports/${SMOKE_DB}-recreate.json"
+```
+
+The command refuses normal database names by default. After it recreates the
+empty database, rerun backend migrations and recreate/verify the fallback
+publication author before starting the next dry run.
+
 ## Dry Run
 
 ```bash
@@ -70,6 +89,22 @@ DOCKER_BIN="$DOCKER_BIN" \
 
 Expected result: status `warn`, not `fail`. The warning should come from known
 target-only or accepted audit warnings, not from missing tables or failed phases.
+
+This result proves only that connections, required tables, planning queries,
+phase order, and expected counts were resolved. It does not exercise inserts,
+foreign keys, unique constraints, or the post-import audit. Review the planned
+counts against the source before execution.
+
+Also review `source_profile` and `source_warnings` in the dry-run report. If
+the source contains text-only descriptions, unattached descriptions, or broken
+allograph-character links, execute mode will stop before writing until there is
+an explicit migration policy for those rows.
+
+For a source where unsupported description rows have been reviewed and approved
+for exclusion, add `--unsupported-description-policy skip` to both dry-run and
+execute commands. The report will record skipped `digipal_description` rows and
+write a sibling `*-skipped-descriptions.json` quarantine artifact when
+`--manifest` is provided.
 
 ## Execute
 
@@ -95,6 +130,12 @@ Expected result:
 - `publications`: `ok`
 - `target_only`: `warn` by design
 
+The author username supplied to `--publication-author-username` must already
+exist in this disposable target. If a phase fails, do not clean individual
+tables and continue unless performing an explicitly documented recovery test.
+Discard and recreate the disposable target so that the next trial starts from
+a known empty state.
+
 ## Post-Import Audit
 
 ```bash
@@ -103,6 +144,8 @@ LEGACY_DATABASE_NAME="$LEGACY_DATABASE_NAME" \
 DOCKER_BIN="$DOCKER_BIN" \
 ./scripts/backend-compose-run.sh python -m commands.audit_legacy_migration \
   --format json \
+  --publication-author-policy fallback \
+  --publication-author-username legacy-import-author \
   --output reports/local-smoke-post-audit.json
 ```
 
@@ -114,3 +157,13 @@ jq -r '.status' reports/local-smoke-post-audit.json
 
 Expected result: `warn`, not `fail`, until all accepted migration warnings have
 been resolved or explicitly signed off.
+
+If the result is `fail`, inspect the failed mappings and checks before changing
+the source or importer:
+
+```bash
+jq '{
+  failed_mappings: [.mappings[] | select(.status == "fail")],
+  failed_checks: [.checks[] | select(.status == "fail")]
+}' reports/local-smoke-post-audit.json
+```

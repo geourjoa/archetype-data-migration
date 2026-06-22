@@ -54,8 +54,9 @@ The current target is clearly a selective migration, not a full clone:
   revisions, South migration history, old page/forms/twitter/gallery tables,
   permissions, ratings, and empty legacy vocabularies.
 - Most domain entity ids were preserved.
-- A few target placeholder rows were introduced with negative ids, notably
-  `-1` item part, scribe, and allograph.
+- A few target placeholder rows can be introduced with negative ids, notably
+  `-1` item part and scribe. Symbol placeholders must be source-policy driven;
+  the importer no longer assumes a hard-coded allograph character id.
 - `common_date` keeps legacy ids but also has target-only seed rows `1` to
   `16`.
 - Some join tables were re-keyed in the target because they became explicit
@@ -84,7 +85,7 @@ The current target is clearly a selective migration, not a full clone:
 | `digipal_hand` | `scribes_hand` | Id-preserved; legacy display fields collapse into target name/place/description. Current `num`, `priority`, and `is_default` drive ordering/default selection. |
 | `digipal_hand_images` | `scribes_hand_item_part_images` | Direct/id-preserved. |
 | `digipal_character` | `symbols_structure_character` | Id-preserved; ontograph/form data flattened into type. |
-| `digipal_allograph` | `symbols_structure_allograph` | Id-preserved; target has synthetic `-1`. |
+| `digipal_allograph` | `symbols_structure_allograph` | Id-preserved. Synthetic placeholders require an explicit source policy. |
 | `digipal_component` | `symbols_structure_component` | Direct/id-preserved. |
 | `digipal_feature` | `symbols_structure_feature` | Direct/id-preserved. |
 | `digipal_component_features` | `symbols_structure_component_features` | Direct/id-preserved. |
@@ -206,7 +207,15 @@ against host Python.
 
 3. Run the read-only audit.
    - Use `audit_legacy_migration`.
-   - Treat `fail` as a blocker.
+   - Against a fresh empty target, expect `fail` because the audit compares
+     source and target contents and the target does not contain the source rows
+     yet. Preserve this report as the baseline; do not treat the expected
+     missing-target results as proof that the source is invalid.
+   - The baseline command can exit non-zero after successfully writing its
+     report because audit status `fail` is represented as a failed process.
+   - Investigate structural errors, missing required tables, connection errors,
+     and unexpected source conditions before proceeding.
+   - After an import, treat `fail` as a blocker.
    - Treat `warn` as requiring sign-off, because warnings identify intentional
      loss, placeholders, or transformed semantics.
 
@@ -237,6 +246,8 @@ against host Python.
    - Check FK integrity.
    - Check target constraints.
    - Run focused application tests.
+   - Between full trials, recreate the disposable target database rather than
+     deleting target table rows by hand.
 
 7. Rebuild derived systems.
    - Run migrations.
@@ -251,6 +262,45 @@ against host Python.
    - Audit output.
    - Any accepted warnings.
    - Any rows intentionally skipped.
+
+## Source Variability And Unsupported Rows
+
+DigiPal databases can share a schema without sharing the same identifiers or
+data profile. The checked-in map and audit describe the source snapshot that
+was inspected during toolkit development; they are not universal constants.
+Every new source must be profiled independently.
+
+In particular, the legacy `digipal_description` model permits a description to
+refer to either a historical item (`historical_item_id`) or a text (`text_id`).
+The current target mapping and importer support historical-item descriptions.
+Text-only descriptions and rows linked to neither entity require an explicit
+policy before execution. They must not be silently discarded merely to satisfy
+target constraints.
+
+The importer default is `--unsupported-description-policy fail`, which stops an
+execute run before any write if text-only, unattached, or dangling description
+rows are present. If the project decides those rows should be excluded from the
+target historical-item description table, rerun with
+`--unsupported-description-policy skip`. That policy imports only descriptions
+linked to an existing historical item and records skipped row counts in the
+manifest/import report. When `--manifest` is provided, the importer also writes
+a sibling `*-skipped-descriptions.json` quarantine artifact containing every
+skipped row and the reason it was excluded.
+
+Use this source-side query during preflight:
+
+```sql
+SELECT
+  count(*) FILTER (WHERE historical_item_id IS NOT NULL AND text_id IS NULL) AS historical_only,
+  count(*) FILTER (WHERE historical_item_id IS NULL AND text_id IS NOT NULL) AS text_only,
+  count(*) FILTER (WHERE historical_item_id IS NOT NULL AND text_id IS NOT NULL) AS both_links,
+  count(*) FILTER (WHERE historical_item_id IS NULL AND text_id IS NULL) AS neither_link
+FROM digipal_description;
+```
+
+Interpret `text_only` as a valid legacy relationship needing a target mapping,
+not automatically as orphaned data. Treat `neither_link` as a data-quality case
+requiring source investigation or an approved quarantine/exclusion decision.
 
 ## Commands
 
@@ -276,6 +326,20 @@ Machine-readable audit:
   --output reports/legacy-migration-audit.json
 ```
 
+Post-import audit for an approved fallback publication author:
+
+```bash
+./scripts/backend-compose-run.sh python -m commands.audit_legacy_migration \
+  --format json \
+  --publication-author-policy fallback \
+  --publication-author-username <target-author-username> \
+  --output reports/legacy-migration-post-audit.json
+```
+
+This does not hide the author decision. It reports `publication_author_mapping`
+as an explicit fallback-author warning with the legacy author breakdown attached
+for sign-off.
+
 CI-style strict audit:
 
 ```bash
@@ -290,6 +354,15 @@ Plan the write import without writing data:
   --manifest reports/legacy-migration-import-dry-run.json
 ```
 
+This dry run validates the read/query and planning path only. Phase status
+`ok` means the phase could be planned; it does not prove that inserts, foreign
+keys, unique constraints, or the post-import audit will pass.
+
+The dry-run manifest includes `source_profile` and `source_warnings`. Review
+description relationship counts, allograph-character integrity, and legacy
+publication authors before execution. Execute mode blocks before any writes when
+these profile checks expose unsupported source shapes without an agreed policy.
+
 Execute against a freshly migrated, backed-up target database:
 
 ```bash
@@ -298,6 +371,16 @@ Execute against a freshly migrated, backed-up target database:
   --allow-warnings \
   --manifest reports/legacy-migration-import-run.json
 ```
+
+`<target-author-username>` must identify an existing target `auth_user`. The
+command does not create that user. `--allow-warnings` permits reviewed audit
+warnings but never permits a final `fail` status.
+
+When unsupported description rows have an approved exclusion policy, add
+`--unsupported-description-policy skip` to both dry-run and execute commands so
+the planned/imported row counts match the intended migration scope. Keep the
+generated `*-skipped-descriptions.json` quarantine artifact with the run
+evidence.
 
 For partial trial runs, repeat `--phase`, for example:
 
@@ -308,6 +391,19 @@ For partial trial runs, repeat `--phase`, for example:
   --publication-author-username <target-author-username> \
   --skip-post-audit
 ```
+
+Recreate a disposable target between full trials:
+
+```bash
+./scripts/backend-compose-run.sh python -m commands.recreate_disposable_target \
+  --database-name legacy_import_trial_YYYYMMDD \
+  --confirm-name legacy_import_trial_YYYYMMDD \
+  --execute \
+  --manifest reports/legacy_import_trial_YYYYMMDD-recreate.json
+```
+
+After this command, run backend migrations and recreate/verify the target
+publication author before importing again.
 
 ## Implementation Notes
 
@@ -322,9 +418,18 @@ For partial trial runs, repeat `--phase`, for example:
 - Save an import report/manifest and final audit output.
 - Refuse to run if `legacy_url` and `target_url` point at the same database.
 
+`recreate_disposable_target` is the guarded trial reset helper. It:
+
+- Refuses protected or normal database names by default.
+- Requires `--execute` and an exact `--confirm-name` before dropping anything.
+- Drops and recreates the entire disposable database; it does not delete rows
+  from a populated target in place.
+
 The importer has been smoke-tested against a disposable, freshly migrated
-target database. The successful trial imported all supported phases and ended
+target database using the specific inspected legacy snapshot. The successful
+trial imported all supported phases for that snapshot and ended
 with audit status `warn`, not `fail`; the remaining warnings match documented
 policy decisions: placeholder rows, filtered duplicate graph details, fallback
 publication author mapping, and target-only data skipped from the legacy source
-database.
+database. Other DigiPal sources may expose additional valid relationships or
+data-quality cases that require new mappings or explicit migration policy.

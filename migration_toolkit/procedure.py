@@ -6,7 +6,7 @@ from typing import Any
 
 from migration_toolkit.audit import AuditReport, report_to_dict
 
-PROCEDURE_VERSION = "2026-06-09"
+PROCEDURE_VERSION = "2026-06-16"
 
 
 @dataclass(frozen=True)
@@ -51,8 +51,11 @@ SAFETY_GATES: tuple[SafetyGate, ...] = (
     SafetyGate(
         key="audit_gate",
         title="Read-only audit gate",
-        rule="Run audit_legacy_migration first. Treat fail as a blocker and require sign-off for warnings.",
-        evidence="Manifest stores audit output path, status, and accepted warnings.",
+        rule=(
+            "Run audit_legacy_migration before and after import. An empty-target baseline normally fails for "
+            "missing target rows; after import, fail is a blocker and warnings require sign-off."
+        ),
+        evidence="Manifest stores baseline and post-import audit paths, statuses, and accepted warnings.",
     ),
     SafetyGate(
         key="empty_target_default",
@@ -61,10 +64,28 @@ SAFETY_GATES: tuple[SafetyGate, ...] = (
         evidence="Preflight row-count report is attached to the manifest.",
     ),
     SafetyGate(
+        key="disposable_reset_only",
+        title="Guarded disposable reset",
+        rule="Recreate whole disposable trial databases instead of deleting target tables by hand.",
+        evidence="Reset report records the disposable database name, confirmation, and follow-up migration steps.",
+    ),
+    SafetyGate(
         key="author_policy",
         title="Publication author policy",
         rule="Do not map publication authors by legacy numeric id. Use username/email mapping or a fallback author.",
         evidence="Manifest records the chosen author policy and sample resolved posts.",
+    ),
+    SafetyGate(
+        key="description_policy",
+        title="Unsupported description policy",
+        rule=(
+            "Treat text-only, unattached, or dangling legacy descriptions as explicit migration policy decisions. "
+            "Do not skip them unless the skipped rows are reviewed and recorded."
+        ),
+        evidence=(
+            "Import report records source_profile counts, the selected unsupported-description policy, "
+            "and skipped rows."
+        ),
     ),
     SafetyGate(
         key="phase_transactions",
@@ -99,12 +120,14 @@ MIGRATION_PHASES: tuple[MigrationPhase, ...] = (
         target_tables=("Django migration table", "current public schema"),
         importer_contract=(
             "Verify legacy and target URLs are present and point to different databases.",
-            "Run the read-only audit before any write step.",
+            "Run and preserve the read-only baseline audit before any write step.",
+            "Profile source-specific optional relationships and data-quality cases before execution.",
             "Collect target migration state and current domain row counts.",
             "Stop if the target is non-empty unless an explicit audit/update mode is approved.",
+            "For repeat trials, recreate only explicitly named disposable target databases.",
         ),
         validation=(
-            "audit_legacy_migration exits without fail status.",
+            "audit_legacy_migration completes and its expected empty-target failures are understood.",
             "showmigrations reports all expected target migrations applied.",
             "Manifest contains operator, environment, source dump, target dump, and approval fields.",
         ),
@@ -137,6 +160,7 @@ MIGRATION_PHASES: tuple[MigrationPhase, ...] = (
             "Map legacy users by username/email, or select one explicit fallback author.",
             "Do not rely on numeric legacy auth_user ids in a fresh target.",
             "Record original legacy username/email where the fallback author is used.",
+            "Run post-import audit with the same fallback-author policy when a fallback author is selected.",
         ),
         validation=(
             "Publication author audit warning is either eliminated or explicitly accepted.",
@@ -186,7 +210,7 @@ MIGRATION_PHASES: tuple[MigrationPhase, ...] = (
         ),
         importer_contract=(
             "Preserve ids for direct vocabularies.",
-            "Keep documented placeholder ids such as allograph -1 explicit.",
+            "Create symbol placeholder rows only when a source-specific policy requires them.",
             "Skip known stale/duplicate rows only when listed in the accepted audit warnings.",
         ),
         validation=(
@@ -219,6 +243,7 @@ MIGRATION_PHASES: tuple[MigrationPhase, ...] = (
         importer_contract=(
             "Preserve ids for current items, historical items, descriptions, catalogue numbers, "
             "item parts, and images.",
+            "Fail on unsupported digipal_description relationships unless an explicit skip policy is approved.",
             "Create the documented -1 item-part placeholder only if needed.",
             "Validate shortened shelfmark/current locus fields before insert.",
         ),
@@ -396,6 +421,13 @@ COMMANDS: tuple[tuple[str, str], ...] = (
         "--format markdown --output reports/legacy-migration-audit.md",
     ),
     (
+        "Write the post-import audit with fallback publication author policy",
+        "./scripts/backend-compose-run.sh python -m commands.audit_legacy_migration "
+        "--format markdown --publication-author-policy fallback "
+        "--publication-author-username <target-author-username> "
+        "--output reports/legacy-migration-post-audit.md",
+    ),
+    (
         "Plan the legacy import without writing data",
         "./scripts/backend-compose-run.sh python -m commands.migrate_legacy_data "
         "--manifest reports/legacy-migration-import-dry-run.json",
@@ -405,6 +437,13 @@ COMMANDS: tuple[tuple[str, str], ...] = (
         "./scripts/backend-compose-run.sh python -m commands.migrate_legacy_data --execute "
         "--publication-author-username <target-author-username> "
         "--allow-warnings --manifest reports/legacy-migration-import-run.json",
+    ),
+    (
+        "Recreate a disposable target between trials",
+        "./scripts/backend-compose-run.sh python -m commands.recreate_disposable_target "
+        "--database-name legacy_import_trial_YYYYMMDD "
+        "--confirm-name legacy_import_trial_YYYYMMDD "
+        "--execute --manifest reports/legacy_import_trial_YYYYMMDD-recreate.json",
     ),
     (
         "Run strict audit in CI or pre-cutover",
@@ -439,6 +478,7 @@ def build_manifest_template(audit_report: AuditReport | None = None) -> dict[str
             "approved_by": "",
             "approved_at": "",
             "author_policy": "",
+            "unsupported_description_policy": "fail",
             "allow_non_empty_target": False,
             "accepted_warnings": [],
         },
@@ -447,6 +487,9 @@ def build_manifest_template(audit_report: AuditReport | None = None) -> dict[str
             "legacy_database": audit_report.legacy_database if audit_report else "",
             "target_database": audit_report.target_database if audit_report else "",
             "report_path": "",
+        },
+        "quarantine_artifacts": {
+            "unsupported_descriptions": "",
         },
         "phases": [
             {
@@ -566,6 +609,42 @@ def render_procedure_markdown(audit_report: AuditReport | None = None) -> str:
             "The automatic deploy can run tests and the read-only audit; the write importer should require "
             "explicit environment variables, approvals, backups, and a filled manifest.",
             "",
+            "## Command Semantics",
+            "",
+            "- `legacy_migration_procedure` renders instructions and a manifest template; it does not test an import.",
+            "- `audit_legacy_migration` compares source and target contents without writing. Against a fresh empty "
+            "target, `fail` and a non-zero exit are normally expected because source rows are missing from the "
+            "target; the generated report is still the useful baseline evidence.",
+            "- `migrate_legacy_data` without `--execute` validates connections, tables, planning queries, phase "
+            "order, and planned counts. It does not test inserts or target constraints.",
+            "- `migrate_legacy_data --execute` writes supported mappings and then runs the post-import audit.",
+            "- `recreate_disposable_target` drops and recreates only explicitly named disposable trial databases; "
+            "it is not a generic target-table cleanup command.",
+            "- A post-import `fail` is a blocker. `--allow-warnings` accepts reviewed warnings only and never "
+            "accepts `fail`.",
+            "- `--unsupported-description-policy fail` is the default. Use `skip` only when text-only, "
+            "unattached, or dangling `digipal_description` rows have been reviewed and accepted as excluded.",
+            "- When unsupported descriptions are skipped and `--manifest` is provided, the importer writes a "
+            "sibling `*-skipped-descriptions.json` quarantine artifact with every skipped row.",
+            "- `--publication-author-username` must name an existing target `auth_user`; the importer does not "
+            "create that user.",
+            "- If the publications phase uses a fallback author, post-import audit should use "
+            "`--publication-author-policy fallback` with the same target user so the manifest records the "
+            "decision explicitly.",
+            "",
+            "## Source Database Variability",
+            "",
+            "DigiPal databases can share a schema while containing different identifiers, optional relationships, "
+            "vocabularies, and data-quality cases. The checked-in audit describes one inspected source snapshot, "
+            "not every DigiPal installation. Review every new source independently and do not silently remove rows "
+            "to make an import pass.",
+            "",
+            "Legacy `digipal_description` rows may refer to a historical item or to a text. The current importer "
+            "supports historical-item descriptions. Text-only descriptions and rows linked to neither entity "
+            "require an explicit mapping, quarantine, or approved exclusion policy before execution. When the "
+            "approved decision is exclusion, run with `--unsupported-description-policy skip`; the report records "
+            "the selected policy, skipped row counts, and a quarantine artifact when `--manifest` is provided.",
+            "",
             "## Safety Gates",
             "",
             "| Gate | Rule | Evidence |",
@@ -613,10 +692,12 @@ def render_procedure_markdown(audit_report: AuditReport | None = None) -> str:
             "",
             "- CI should run unit tests for the audit/procedure modules.",
             "- Pre-cutover should run `audit_legacy_migration`; fail status blocks the deployment.",
+            "  This refers to the populated target after import, not the expected empty-target baseline.",
             "- Warning status requires a human to list accepted warnings in the manifest.",
             "- `migrate_legacy_data` plans by default and writes only with `--execute`.",
             "- The write import should run against a freshly migrated target unless "
             "`--allow-non-empty-target` is explicitly approved.",
+            "- Trial resets should recreate a disposable target database and then rerun backend migrations.",
             "- Post-cutover should run sequence sync, focused tests, smoke checks, and search rebuild.",
             "",
             "## Command Reference",
@@ -645,6 +726,9 @@ def render_procedure_markdown(audit_report: AuditReport | None = None) -> str:
             "  --manifest reports/legacy-migration-import-dry-run.json",
             "```",
             "",
+            "A successful dry run proves that the import can be planned. It does not prove that inserts, foreign "
+            "keys, unique constraints, or post-import comparisons will pass.",
+            "",
             "Execute only against a backed-up, freshly migrated target database:",
             "",
             "```bash",
@@ -656,8 +740,20 @@ def render_procedure_markdown(audit_report: AuditReport | None = None) -> str:
             "  --manifest reports/legacy-migration-import-run.json",
             "```",
             "",
+            "The publication author username must already exist in the target database. `--allow-warnings` permits "
+            "reviewed warning status but never permits fail status.",
+            "",
+            "If the source profile reports text-only, unattached, or dangling `digipal_description` rows, the "
+            "default execute mode stops before writing. To run after an approved exclusion decision, add "
+            "`--unsupported-description-policy skip`; the command then imports only descriptions linked to an "
+            "existing historical item and records skipped rows in the manifest. With `--manifest`, the command "
+            "also writes a sibling `*-skipped-descriptions.json` quarantine artifact.",
+            "",
             "The command refuses same-database URLs, missing tables, and non-empty import targets by default. "
             "Use `--allow-non-empty-target` only for an approved recovery or incremental trial.",
+            "",
+            "For repeat trials, use `recreate_disposable_target` on an explicitly named disposable database. "
+            "After recreating it, apply backend migrations and recreate/verify the target publication author.",
         ]
     )
 
